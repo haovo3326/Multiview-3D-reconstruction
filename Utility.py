@@ -57,39 +57,51 @@ def get_correspondence(img1Gray, img2Gray):
     return pts1, pts2
 
 
-def rounding_and_unique(pts1, pts2):
-    F, mask = cv2.findFundamentalMat(
+def rounding_and_unique(K, pts1, pts2):
+    E, mask = cv2.findEssentialMat(
         pts1,
         pts2,
-        cv2.FM_RANSAC,
-        ransacReprojThreshold=1.0,
-        confidence=0.99
+        K,
+        method=cv2.RANSAC,
+        prob=0.999,
+        threshold=1.0
     )
 
-    # Keep inliers only
     pts1_inlier = pts1[mask.ravel() == 1]
     pts2_inlier = pts2[mask.ravel() == 1]
 
-    # Rounding
     pts1_int = [(round(x), round(y)) for x, y in pts1_inlier]
     pts2_int = [(round(x), round(y)) for x, y in pts2_inlier]
 
-    # Removing overlapping
     pairs = []
+
+    K_inv = np.linalg.inv(K)
     for p1, p2 in zip(pts1_int, pts2_int):
-        x1 = np.array([p1[0], p1[1], 1.0], dtype=np.float32)
-        x2 = np.array([p2[0], p2[1], 1.0], dtype=np.float32)
-        error = abs(x2 @ F @ x1)
+        x1 = np.array([p1[0], p1[1], 1.0], dtype=np.float64)
+        x2 = np.array([p2[0], p2[1], 1.0], dtype=np.float64)
+        x1n = K_inv @ x1
+        x2n = K_inv @ x2
+        error = abs(x2n @ E @ x1n)
         pairs.append((p1, p2, error))
+
     pairs.sort(key=lambda t: t[2])
+
     used1 = set()
     used2 = set()
     best_pairs = []
+
     for p1, p2, error in pairs:
         if p1 not in used1 and p2 not in used2:
-            best_pairs.append((p1, p2, error))
+            best_pairs.append((p1, p2))
             used1.add(p1)
             used2.add(p2)
-    pts1_unique = [p1 for p1, p2, error in best_pairs]
-    pts2_unique = [p2 for p1, p2, error in best_pairs]
-    return pts1_unique, pts2_unique
+
+    pts1_unique = np.array([p1 for p1, p2 in best_pairs], dtype=np.float32)
+    pts2_unique = np.array([p2 for p1, p2 in best_pairs], dtype=np.float32)
+
+    _, R, t, pose_mask = cv2.recoverPose(E, pts1_unique, pts2_unique, K)
+
+    pts1_final = pts1_unique[pose_mask.ravel() == 255]
+    pts2_final = pts2_unique[pose_mask.ravel() == 255]
+
+    return R, t, pts1_final, pts2_final

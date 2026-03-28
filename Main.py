@@ -1,13 +1,16 @@
 import os
+
+import numpy as np
+
 import Utility
 import cv2
-import numpy as np
 import DSU
+import Calibration
 
-def feature_matching(img1, img2):
+def feature_matching(K, img1, img2):
     pts1, pts2 = Utility.get_correspondence(img1, img2)
-    pts1_unique, pts2_unique = Utility.rounding_and_unique(pts1, pts2)
-    return zip(pts1_unique, pts2_unique)
+    R, t, pts1_unique, pts2_unique = Utility.rounding_and_unique(K, pts1, pts2)
+    return R, t, zip(pts1_unique, pts2_unique)
 
 root = os.getcwd()
 image1_path = os.path.join(root, "Sample", "Image 1.jpg")
@@ -19,9 +22,12 @@ image2 = cv2.imread(image2_path)
 image3 = cv2.imread(image3_path)
 image4 = cv2.imread(image4_path)
 
-matches12 = feature_matching(image1, image2)
-matches23 = feature_matching(image2, image3)
-matches34 = feature_matching(image3, image4)
+K = Calibration.calibrate()
+
+# Build DSU for tracking correspondences
+R12, t12, matches12 = feature_matching(K, image1, image2)
+R23, t23, matches23 = feature_matching(K, image2, image3)
+R34, t34, matches34 = feature_matching(K, image3, image4)
 
 dsu = DSU.DSU()
 for pt1, pt2 in matches12:
@@ -32,7 +38,23 @@ for pt1, pt2 in matches34:
     dsu.union((3, pt1), (4, pt2))
 tracks = dsu.groups()
 
+# Reconstructing camera matrix
+R1 = np.eye(3)
+t1 = np.zeros((3, 1))
 
+R2 = R12
+t2 = t12
+
+R3 = R23 @ R2
+t3 = R23 @ t2 + t23
+
+R4 = R34 @ R3
+t4 = R34 @ t3 + t34
+
+P1 = K @ np.hstack((R1, t1))
+P2 = K @ np.hstack((R2, t2))
+P3 = K @ np.hstack((R3, t3))
+P4 = K @ np.hstack((R4, t4))
 
 
 

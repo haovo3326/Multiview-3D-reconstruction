@@ -21,6 +21,7 @@ def calibrate():
 
         path = os.path.join(image_folder, filename)
         img = cv2.imread(path)
+        img = cv2.resize(img, (640, 640))
 
         if img is None:
             continue
@@ -51,7 +52,7 @@ def calibrate():
     _, K, _, _, _ = cv2.calibrateCamera(
         objpoints,
         imgpoints,
-        (1280, 1280),
+        (640, 640),
         None,
         None
     )

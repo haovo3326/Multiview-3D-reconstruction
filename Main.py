@@ -6,6 +6,7 @@ import Utility
 import cv2
 import DSU
 import Calibration
+import matplotlib.pyplot as plt
 
 def feature_matching(K, img1, img2):
     pts1, pts2 = Utility.get_correspondence(img1, img2)
@@ -55,6 +56,41 @@ P1 = K @ np.hstack((R1, t1))
 P2 = K @ np.hstack((R2, t2))
 P3 = K @ np.hstack((R3, t3))
 P4 = K @ np.hstack((R4, t4))
+
+camera = [P1, P2, P3, P4]
+points3D = []
+
+for track in tracks:
+    A = []
+    for p in track:
+        camera_id, coord = p
+        u, v = coord
+        P = camera[camera_id - 1]
+        p1 = P[0]
+        p2 = P[1]
+        p3 = P[2]
+        A.append(u * p3 - p1)
+        A.append(v * p3 - p2)
+    A = np.array(A)
+    _, _, Vt = np.linalg.svd(A)
+    X = Vt[-1]
+    X = X / X[3]
+    points3D.append(X[:3])
+
+points3D = np.array(points3D)
+
+fig = plt.figure()
+ax = fig.add_subplot(111, projection='3d')
+
+ax.scatter(points3D[:, 0], points3D[:, 1], points3D[:, 2], s=5)
+ax.set_xlabel("X")
+ax.set_ylabel("Y")
+ax.set_zlabel("Z")
+
+plt.show()
+
+
+
 
 
 

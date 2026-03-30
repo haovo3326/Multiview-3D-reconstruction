@@ -18,14 +18,17 @@ image1_path = os.path.join(root, "Sample", "Image 1.png")
 image2_path = os.path.join(root, "Sample", "Image 2.png")
 image3_path = os.path.join(root, "Sample", "Image 3.png")
 image4_path = os.path.join(root, "Sample", "Image 4.png")
+
 image1 = cv2.imread(image1_path)
 image2 = cv2.imread(image2_path)
 image3 = cv2.imread(image3_path)
 image4 = cv2.imread(image4_path)
-image1 = cv2.resize(image1, (640, 640))
-image2 = cv2.resize(image2, (640, 640))
-image3 = cv2.resize(image3, (640, 640))
-image4 = cv2.resize(image4, (640, 640))
+
+image1 = cv2.resize(image1, (860, 860))
+image2 = cv2.resize(image2, (860, 860))
+image3 = cv2.resize(image3, (860, 860))
+image4 = cv2.resize(image4, (860, 860))
+
 
 K = Calibration.calibrate()
 
@@ -79,6 +82,8 @@ camera = [P1, P2, P3, P4]
 points3D = []
 
 for track in tracks:
+    if len(track) > 2:
+        print(track)
     A = []
     for p in track:
         camera_id, coord = p

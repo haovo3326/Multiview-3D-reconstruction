@@ -22,7 +22,7 @@ def get_correspondence(img1Gray, img2Gray):
     timg1 = timg1.unsqueeze(0).unsqueeze(0).to(device)
     timg2 = timg2.unsqueeze(0).unsqueeze(0).to(device)
 
-    # Load pretrained LoFTR
+    # Load pretrained LoFTR Model
     matcher = KF.LoFTR(pretrained="outdoor").to(device).eval()
 
     with torch.no_grad():

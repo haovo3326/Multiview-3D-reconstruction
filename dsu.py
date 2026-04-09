@@ -1,12 +1,13 @@
-class DSU:
+class dsu:
     def __init__(self):
+        self.point3d = {}
         self.parent = {}
-        self.rank = {}
+        self.dsu = {}
 
     def make_set(self, x):
         if x not in self.parent:
             self.parent[x] = x
-            self.rank[x] = 0
+            self.dsu[x] = 0
 
     def find(self, x):
         if self.parent[x] != x:
@@ -23,13 +24,13 @@ class DSU:
         if rx == ry:
             return
 
-        if self.rank[rx] < self.rank[ry]:
+        if self.dsu[rx] < self.dsu[ry]:
             self.parent[rx] = ry
-        elif self.rank[rx] > self.rank[ry]:
+        elif self.dsu[rx] > self.dsu[ry]:
             self.parent[ry] = rx
         else:
             self.parent[ry] = rx
-            self.rank[rx] += 1
+            self.dsu[rx] += 1
 
     def groups(self):
         res = {}

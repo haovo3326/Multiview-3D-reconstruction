@@ -17,7 +17,7 @@ class Constructor:
 
         self.images = []
         self.features = []
-        self.camera_matrices = []
+        self.camera_matrices = []   # each item: {"K": K, "r": rvec, "t": tvec}
 
         self.tracker = dsu()
         self.tracks = []
@@ -73,7 +73,15 @@ class Constructor:
     def build_projection_matrix(self, K, R, t):
         return (K @ np.hstack((R, t))).astype(np.float64)
 
+    def get_projection_matrix(self, cam):
+        R, _ = cv2.Rodrigues(cam["r"])
+        return self.build_projection_matrix(cam["K"], R, cam["t"])
+
     def construct_anchor(self, K):
+        if len(self.features) < 2:
+            print("Need at least 2 images")
+            return []
+
         features0 = self.features[0]
         features1 = self.features[1]
 
@@ -83,13 +91,29 @@ class Constructor:
         matches01 = self.feature_matching(features0, features1)
         matches01, R, t = self.compute_pose(keypoints0, keypoints1, matches01, K)
 
+        if R is None or t is None or len(matches01) == 0:
+            print("Anchor pose failed")
+            return []
+
         P0 = self.build_projection_matrix(K, np.eye(3), np.zeros((3, 1)))
         P1 = self.build_projection_matrix(K, R, t)
 
-        self.camera_matrices.append(P0)
-        self.camera_matrices.append(P1)
+        rvec, _ = cv2.Rodrigues(R)
+        rvec = rvec.astype(np.float64).reshape(3, 1)
+        t = t.astype(np.float64).reshape(3, 1)
 
-        # build DSU tracks
+        self.camera_matrices = []
+        self.camera_matrices.append({
+            "K": K,
+            "r": np.zeros((3, 1), dtype=np.float64),
+            "t": np.zeros((3, 1), dtype=np.float64)
+        })
+        self.camera_matrices.append({
+            "K": K,
+            "r": rvec,
+            "t": t
+        })
+
         for i0, i1 in matches01:
             node0 = (0, int(i0))
             node1 = (1, int(i1))
@@ -97,7 +121,6 @@ class Constructor:
 
         self.build_track_objects()
 
-        # triangulate for 2-view anchor tracks
         for i0, i1 in matches01:
             node0 = (0, int(i0))
             track_id = self.node_to_track_id[node0]
@@ -124,10 +147,8 @@ class Constructor:
             keypoints_cur = features_cur['keypoints'][0].cpu().numpy().astype(np.float32)
             keypoints_pre = features_pre['keypoints'][0].cpu().numpy().astype(np.float32)
 
-            # raw matches
             matches_pre_cur = self.feature_matching(features_pre, features_cur)
 
-            # keep only geometric inliers between pre and cur
             matches_pre_cur, _, _ = self.compute_pose(
                 keypoints_pre,
                 keypoints_cur,
@@ -136,16 +157,13 @@ class Constructor:
             )
 
             if len(matches_pre_cur) == 0:
-                print(f"Image {i}: no valid pre-cur matches")
+                print(f"Image {i + 1}: no valid pre-cur matches")
                 continue
 
-            # split into:
-            # 1) old-track matches -> for PnP
-            # 2) new matches -> for triangulation
             object_points = []
             image_points = []
-            tracked_pairs = []  # (track_id, idx_cur)
-            new_matches = []  # (idx_pre, idx_cur)
+            tracked_pairs = []
+            new_matches = []
 
             for idx_pre, idx_cur in matches_pre_cur:
                 node_pre = (i - 1, int(idx_pre))
@@ -154,18 +172,20 @@ class Constructor:
                     track_id = self.node_to_track_id[node_pre]
                     track = self.tracks[track_id]
 
-                    object_points.append(track["point3d"])
-                    image_points.append(keypoints_cur[int(idx_cur)])
-                    tracked_pairs.append((track_id, int(idx_cur)))
+                    if track["is_computed"] and track["point3d"] is not None:
+                        object_points.append(track["point3d"])
+                        image_points.append(keypoints_cur[int(idx_cur)])
+                        tracked_pairs.append((track_id, int(idx_cur)))
+                    else:
+                        new_matches.append((int(idx_pre), int(idx_cur)))
                 else:
                     new_matches.append((int(idx_pre), int(idx_cur)))
 
             object_points = np.asarray(object_points, dtype=np.float32).reshape(-1, 3)
             image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 2)
 
-            # need pose to triangulate new matches
             if len(object_points) < 4:
-                print(f"Image {i}: not enough old-track correspondences for PnP")
+                print(f"Image {i + 1}: not enough old-track correspondences for PnP")
                 continue
 
             success, rvec, tvec, inliers = cv2.solvePnPRansac(
@@ -180,40 +200,45 @@ class Constructor:
             )
 
             if not success or inliers is None or len(inliers) < 4:
-                print(f"Image {i}: PnP failed")
+                print(f"Image {i + 1}: PnP failed")
                 continue
 
             inlier_idx = inliers.ravel()
             tracked_pairs_inlier = [tracked_pairs[j] for j in inlier_idx]
 
+            rvec = rvec.astype(np.float64).reshape(3, 1)
+            tvec = tvec.astype(np.float64).reshape(3, 1)
             R, _ = cv2.Rodrigues(rvec)
-            P_cur = self.build_projection_matrix(K, R, tvec)
-            P_pre = self.camera_matrices[i - 1]
-            self.camera_matrices.append(P_cur)
+            R = R.astype(np.float64)
 
-            # save old 3D points before rebuilding tracks
+            P_cur = self.build_projection_matrix(K, R, tvec)
+            cam_pre = self.camera_matrices[i - 1]
+            P_pre = self.get_projection_matrix(cam_pre)
+
+            self.camera_matrices.append({
+                "K": K,
+                "r": rvec,
+                "t": tvec
+            })
+
             old_node_to_point3d = {}
             for track in self.tracks:
                 if track["is_computed"] and track["point3d"] is not None:
                     for node in track["observations"]:
                         old_node_to_point3d[node] = track["point3d"]
 
-            # merge PnP inlier current observations into old tracks
             for track_id, idx_cur in tracked_pairs_inlier:
                 node_cur = (i, int(idx_cur))
                 old_node = self.tracks[track_id]["observations"][0]
                 self.tracker.union(old_node, node_cur)
 
-            # create new tracks from unseen matches
             for idx_pre, idx_cur in new_matches:
                 node_pre = (i - 1, int(idx_pre))
                 node_cur = (i, int(idx_cur))
                 self.tracker.union(node_pre, node_cur)
 
-            # rebuild
             self.build_track_objects()
 
-            # restore old computed points
             for track in self.tracks:
                 for node in track["observations"]:
                     if node in old_node_to_point3d:
@@ -221,7 +246,6 @@ class Constructor:
                         track["is_computed"] = True
                         break
 
-            # triangulate only the truly new tracks
             triangulated_track_ids = set()
 
             for idx_pre, idx_cur in new_matches:
@@ -245,7 +269,6 @@ class Constructor:
             print(f"Image {i + 1}: PnP inliers = {len(inlier_idx)}")
             print(f"Image {i + 1}: new matches triangulated = {len(triangulated_track_ids)}")
 
-
     def build_track_objects(self):
         groups = self.tracker.groups()
         self.tracks = []
@@ -255,8 +278,8 @@ class Constructor:
             track = {
                 "track_id": track_id,
                 "observations": sorted(group, key=lambda x: x[0]),
-                "point3d": None,        # luôn có slot
-                "is_computed": False    # mặc định chưa tính
+                "point3d": None,
+                "is_computed": False
             }
             self.tracks.append(track)
 
@@ -282,7 +305,7 @@ class Constructor:
             print("No 3D points to display")
             return
 
-        points = np.array(points)  # (N, 3)
+        points = np.array(points)
 
         fig = plt.figure()
         ax = fig.add_subplot(111, projection='3d')
@@ -303,6 +326,7 @@ builder.load_img("Sample/Image 1.png")
 builder.load_img("Sample/Image 2.png")
 builder.load_img("Sample/Image 3.png")
 builder.load_img("Sample/Image 4.png")
+
 builder.construct_anchor(K)
 builder.construct_scene(K)
 builder.show_point_cloud()

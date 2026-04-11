@@ -1,6 +1,8 @@
 import torch
 import numpy as np
 import cv2
+from matplotlib import pyplot as plt
+
 from lightglue import LightGlue, SuperPoint
 from lightglue.utils import load_image, rbd
 import calibration
@@ -33,6 +35,9 @@ class Constructor:
         return matches['matches'].cpu().numpy()
 
     def compute_pose(self, keypoints0, keypoints1, matches01, K):
+        if len(matches01) == 0:
+            return np.empty((0, 2), dtype=int), None, None
+
         samples0 = keypoints0[matches01[:, 0]]
         samples1 = keypoints1[matches01[:, 1]]
 
@@ -45,14 +50,23 @@ class Constructor:
             threshold=1.0
         )
 
+        if E is None or inlier_mask is None:
+            return np.empty((0, 2), dtype=int), None, None
+
         inlier_mask = inlier_mask.ravel().astype(bool)
         matches01 = matches01[inlier_mask]
         samples0 = samples0[inlier_mask]
         samples1 = samples1[inlier_mask]
 
+        if len(matches01) == 0:
+            return np.empty((0, 2), dtype=int), None, None
+
         _, R, t, pose_mask = cv2.recoverPose(E, samples0, samples1, K)
         pose_mask = pose_mask.ravel().astype(bool)
         matches01 = matches01[pose_mask]
+
+        if len(matches01) == 0:
+            return np.empty((0, 2), dtype=int), None, None
 
         return matches01, R, t
 
@@ -88,6 +102,9 @@ class Constructor:
             node0 = (0, int(i0))
             track_id = self.node_to_track_id[node0]
 
+            if self.tracks[track_id]["is_computed"]:
+                continue
+
             pt0 = keypoints0[int(i0)].reshape(2, 1)
             pt1 = keypoints1[int(i1)].reshape(2, 1)
 
@@ -107,7 +124,126 @@ class Constructor:
             keypoints_cur = features_cur['keypoints'][0].cpu().numpy().astype(np.float32)
             keypoints_pre = features_pre['keypoints'][0].cpu().numpy().astype(np.float32)
 
-            matches_pre_cur, _, _ = self.feature_matching(features_pre, features_cur)
+            # raw matches
+            matches_pre_cur = self.feature_matching(features_pre, features_cur)
+
+            # keep only geometric inliers between pre and cur
+            matches_pre_cur, _, _ = self.compute_pose(
+                keypoints_pre,
+                keypoints_cur,
+                matches_pre_cur,
+                K
+            )
+
+            if len(matches_pre_cur) == 0:
+                print(f"Image {i}: no valid pre-cur matches")
+                continue
+
+            # split into:
+            # 1) old-track matches -> for PnP
+            # 2) new matches -> for triangulation
+            object_points = []
+            image_points = []
+            tracked_pairs = []  # (track_id, idx_cur)
+            new_matches = []  # (idx_pre, idx_cur)
+
+            for idx_pre, idx_cur in matches_pre_cur:
+                node_pre = (i - 1, int(idx_pre))
+
+                if node_pre in self.node_to_track_id:
+                    track_id = self.node_to_track_id[node_pre]
+                    track = self.tracks[track_id]
+
+                    object_points.append(track["point3d"])
+                    image_points.append(keypoints_cur[int(idx_cur)])
+                    tracked_pairs.append((track_id, int(idx_cur)))
+                else:
+                    new_matches.append((int(idx_pre), int(idx_cur)))
+
+            object_points = np.asarray(object_points, dtype=np.float32).reshape(-1, 3)
+            image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 2)
+
+            # need pose to triangulate new matches
+            if len(object_points) < 4:
+                print(f"Image {i}: not enough old-track correspondences for PnP")
+                continue
+
+            success, rvec, tvec, inliers = cv2.solvePnPRansac(
+                object_points,
+                image_points,
+                K,
+                None,
+                reprojectionError=8.0,
+                confidence=0.999,
+                iterationsCount=1000,
+                flags=cv2.SOLVEPNP_ITERATIVE
+            )
+
+            if not success or inliers is None or len(inliers) < 4:
+                print(f"Image {i}: PnP failed")
+                continue
+
+            inlier_idx = inliers.ravel()
+            tracked_pairs_inlier = [tracked_pairs[j] for j in inlier_idx]
+
+            R, _ = cv2.Rodrigues(rvec)
+            P_cur = self.build_projection_matrix(K, R, tvec)
+            P_pre = self.camera_matrices[i - 1]
+            self.camera_matrices.append(P_cur)
+
+            # save old 3D points before rebuilding tracks
+            old_node_to_point3d = {}
+            for track in self.tracks:
+                if track["is_computed"] and track["point3d"] is not None:
+                    for node in track["observations"]:
+                        old_node_to_point3d[node] = track["point3d"]
+
+            # merge PnP inlier current observations into old tracks
+            for track_id, idx_cur in tracked_pairs_inlier:
+                node_cur = (i, int(idx_cur))
+                old_node = self.tracks[track_id]["observations"][0]
+                self.tracker.union(old_node, node_cur)
+
+            # create new tracks from unseen matches
+            for idx_pre, idx_cur in new_matches:
+                node_pre = (i - 1, int(idx_pre))
+                node_cur = (i, int(idx_cur))
+                self.tracker.union(node_pre, node_cur)
+
+            # rebuild
+            self.build_track_objects()
+
+            # restore old computed points
+            for track in self.tracks:
+                for node in track["observations"]:
+                    if node in old_node_to_point3d:
+                        track["point3d"] = old_node_to_point3d[node]
+                        track["is_computed"] = True
+                        break
+
+            # triangulate only the truly new tracks
+            triangulated_track_ids = set()
+
+            for idx_pre, idx_cur in new_matches:
+                node_pre = (i - 1, int(idx_pre))
+                track_id = self.node_to_track_id[node_pre]
+                track = self.tracks[track_id]
+
+                if track["is_computed"] or track_id in triangulated_track_ids:
+                    continue
+
+                pt_pre = keypoints_pre[int(idx_pre)].reshape(2, 1)
+                pt_cur = keypoints_cur[int(idx_cur)].reshape(2, 1)
+
+                X_h = cv2.triangulatePoints(P_pre, P_cur, pt_pre, pt_cur)
+                X = (X_h[:3] / X_h[3]).reshape(3)
+
+                track["point3d"] = X
+                track["is_computed"] = True
+                triangulated_track_ids.add(track_id)
+
+            print(f"Image {i + 1}: PnP inliers = {len(inlier_idx)}")
+            print(f"Image {i + 1}: new matches triangulated = {len(triangulated_track_ids)}")
 
 
     def build_track_objects(self):
@@ -135,12 +271,38 @@ class Constructor:
             print(f"Computed: {track['is_computed']}")
             print("-" * 40)
 
+    def show_point_cloud(self):
+        points = []
+
+        for track in self.tracks:
+            if track["is_computed"] and track["point3d"] is not None:
+                points.append(track["point3d"])
+
+        if len(points) == 0:
+            print("No 3D points to display")
+            return
+
+        points = np.array(points)  # (N, 3)
+
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection='3d')
+
+        ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=2)
+
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+
+        plt.show()
+
 
 # Testing
 K = calibration.calibrate()
 builder = Constructor()
 builder.load_img("Sample/Image 1.png")
 builder.load_img("Sample/Image 2.png")
-
-tracks = builder.construct_anchor(K)
-builder.print_tracks()
+builder.load_img("Sample/Image 3.png")
+builder.load_img("Sample/Image 4.png")
+builder.construct_anchor(K)
+builder.construct_scene(K)
+builder.show_point_cloud()

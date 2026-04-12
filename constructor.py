@@ -5,19 +5,20 @@ from matplotlib import pyplot as plt
 
 from lightglue import LightGlue, SuperPoint
 from lightglue.utils import load_image, rbd
-import calibration
+from scipy.spatial.transform import Rotation
 from dsu import dsu
 
 
 class Constructor:
-    def __init__(self):
+    def __init__(self, K):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.extractor = SuperPoint(max_num_keypoints=2048).eval().to(self.device)
         self.matcher = LightGlue(features='superpoint').eval().to(self.device)
 
         self.images = []
         self.features = []
-        self.camera_matrices = []   # each item: {"K": K, "r": rvec, "t": tvec}
+        self.K = K.astype(np.float64)
+        self.camera_matrices = []   # each item: {"q": quaternion_xyzw, "t": tvec}
 
         self.tracker = dsu()
         self.tracks = []
@@ -68,16 +69,27 @@ class Constructor:
         if len(matches01) == 0:
             return np.empty((0, 2), dtype=int), None, None
 
-        return matches01, R, t
+        return matches01, R.astype(np.float64), t.astype(np.float64)
 
     def build_projection_matrix(self, K, R, t):
         return (K @ np.hstack((R, t))).astype(np.float64)
 
-    def get_projection_matrix(self, cam):
-        R, _ = cv2.Rodrigues(cam["r"])
-        return self.build_projection_matrix(cam["K"], R, cam["t"])
+    def rotation_matrix_to_quaternion(self, R):
+        # SciPy uses quaternion order [x, y, z, w]
+        q = Rotation.from_matrix(R).as_quat()
+        return q.astype(np.float64).reshape(4, 1)
 
-    def construct_anchor(self, K):
+    def quaternion_to_rotation_matrix(self, q):
+        q = np.asarray(q, dtype=np.float64).reshape(4)
+        q = q / np.linalg.norm(q)
+        R = Rotation.from_quat(q).as_matrix()
+        return R.astype(np.float64)
+
+    def get_projection_matrix(self, cam):
+        R = self.quaternion_to_rotation_matrix(cam["q"])
+        return self.build_projection_matrix(self.K, R, cam["t"])
+
+    def construct_anchor(self):
         if len(self.features) < 2:
             print("Need at least 2 images")
             return []
@@ -89,28 +101,25 @@ class Constructor:
         keypoints1 = features1['keypoints'][0].cpu().numpy().astype(np.float32)
 
         matches01 = self.feature_matching(features0, features1)
-        matches01, R, t = self.compute_pose(keypoints0, keypoints1, matches01, K)
+        matches01, R, t = self.compute_pose(keypoints0, keypoints1, matches01, self.K)
 
         if R is None or t is None or len(matches01) == 0:
             print("Anchor pose failed")
             return []
 
-        P0 = self.build_projection_matrix(K, np.eye(3), np.zeros((3, 1)))
-        P1 = self.build_projection_matrix(K, R, t)
+        P0 = self.build_projection_matrix(self.K, np.eye(3, dtype=np.float64), np.zeros((3, 1), dtype=np.float64))
+        P1 = self.build_projection_matrix(self.K, R, t)
 
-        rvec, _ = cv2.Rodrigues(R)
-        rvec = rvec.astype(np.float64).reshape(3, 1)
+        q1 = self.rotation_matrix_to_quaternion(R)
         t = t.astype(np.float64).reshape(3, 1)
 
         self.camera_matrices = []
         self.camera_matrices.append({
-            "K": K,
-            "r": np.zeros((3, 1), dtype=np.float64),
+            "q": np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64).reshape(4, 1),  # identity rotation in [x,y,z,w]
             "t": np.zeros((3, 1), dtype=np.float64)
         })
         self.camera_matrices.append({
-            "K": K,
-            "r": rvec,
+            "q": q1,
             "t": t
         })
 
@@ -139,7 +148,7 @@ class Constructor:
 
         return self.tracks
 
-    def construct_scene(self, K):
+    def construct_scene(self):
         for i in range(2, len(self.features)):
             features_cur = self.features[i]
             features_pre = self.features[i - 1]
@@ -153,7 +162,7 @@ class Constructor:
                 keypoints_pre,
                 keypoints_cur,
                 matches_pre_cur,
-                K
+                self.K
             )
 
             if len(matches_pre_cur) == 0:
@@ -191,7 +200,7 @@ class Constructor:
             success, rvec, tvec, inliers = cv2.solvePnPRansac(
                 object_points,
                 image_points,
-                K,
+                self.K,
                 None,
                 reprojectionError=8.0,
                 confidence=0.999,
@@ -208,16 +217,18 @@ class Constructor:
 
             rvec = rvec.astype(np.float64).reshape(3, 1)
             tvec = tvec.astype(np.float64).reshape(3, 1)
-            R, _ = cv2.Rodrigues(rvec)
-            R = R.astype(np.float64)
 
-            P_cur = self.build_projection_matrix(K, R, tvec)
+            R_cur, _ = cv2.Rodrigues(rvec)
+            R_cur = R_cur.astype(np.float64)
+            q_cur = self.rotation_matrix_to_quaternion(R_cur)
+
+            P_cur = self.build_projection_matrix(self.K, R_cur, tvec)
+
             cam_pre = self.camera_matrices[i - 1]
             P_pre = self.get_projection_matrix(cam_pre)
 
             self.camera_matrices.append({
-                "K": K,
-                "r": rvec,
+                "q": q_cur,
                 "t": tvec
             })
 
@@ -317,16 +328,3 @@ class Constructor:
         ax.set_zlabel('Z')
 
         plt.show()
-
-
-# Testing
-K = calibration.calibrate()
-builder = Constructor()
-builder.load_img("Sample/Image 1.png")
-builder.load_img("Sample/Image 2.png")
-builder.load_img("Sample/Image 3.png")
-builder.load_img("Sample/Image 4.png")
-
-builder.construct_anchor(K)
-builder.construct_scene(K)
-builder.show_point_cloud()

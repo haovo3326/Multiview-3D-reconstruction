@@ -7,22 +7,15 @@ class GDOptimizer:
     def __init__(self, constructor):
         self.constructor = constructor
 
-    def _normalize_quaternion(self, q):
+    def _quat_norm_jacobian(self, q):
         q = np.asarray(q, dtype=np.float64).reshape(4)
         n = np.linalg.norm(q)
         if n < 1e-12:
             raise ValueError("Quaternion norm is too close to zero.")
-        return q / n, n
 
-    def _quat_norm_jacobian(self, q_raw):
-        q_raw = np.asarray(q_raw, dtype=np.float64).reshape(4)
-        n = np.linalg.norm(q_raw)
-        if n < 1e-12:
-            raise ValueError("Quaternion norm is too close to zero.")
-
-        q_unit = q_raw / n
+        q_prime = q / n
         I = np.eye(4, dtype=np.float64)
-        J = (I - np.outer(q_unit, q_unit)) / n
+        J = (I - np.outer(q_prime, q_prime)) / n
         return J
 
     def _get_tracks(self):
@@ -77,11 +70,15 @@ class GDOptimizer:
 
                 cam = self.constructor.camera_matrices[img_id]
 
-                q_raw = np.asarray(cam["q"], dtype=np.float64).reshape(4)
-                q_unit, _ = self._normalize_quaternion(q_raw)
+                q = np.asarray(cam["q"], dtype=np.float64).reshape(4)
+                q_norm = np.linalg.norm(q)
+                if q_norm < 1e-12:
+                    continue
 
-                w, x, y, z = q_unit
-                R = utility.quaternion_to_R(q_unit).astype(np.float64)
+                q_prime = q / q_norm
+                w, x, y, z = q_prime
+
+                R = utility.quaternion_to_R(q).astype(np.float64)
                 t = np.asarray(cam["t"], dtype=np.float64).reshape(3)
 
                 Z = R @ X_vec + t
@@ -138,8 +135,8 @@ class GDOptimizer:
                     np.sum(dL_dR * dR_dz_prime)
                 ], dtype=np.float64)
 
-                J_norm = self._quat_norm_jacobian(q_raw)
-                dL_dq_raw = J_norm.T @ dL_dq_prime
+                J_norm = self._quat_norm_jacobian(q)
+                dL_dq = J_norm.T @ dL_dq_prime
 
                 global_X_grads[root] += dL_dX
 
@@ -149,7 +146,7 @@ class GDOptimizer:
                     global_cam_count[img_id] = 0
 
                 global_t_grads[img_id] += dL_dt
-                global_q_grads[img_id] += dL_dq_raw
+                global_q_grads[img_id] += dL_dq
                 global_cam_count[img_id] += 1
 
         for img_id in global_cam_count:
@@ -184,10 +181,9 @@ class GDOptimizer:
 
                 cam = self.constructor.camera_matrices[img_id]
 
-                q_raw = np.asarray(cam["q"], dtype=np.float64).reshape(4)
-                q_unit, _ = self._normalize_quaternion(q_raw)
+                q = np.asarray(cam["q"], dtype=np.float64).reshape(4)
 
-                R = utility.quaternion_to_R(q_unit).astype(np.float64)
+                R = utility.quaternion_to_R(q).astype(np.float64)
                 t = np.asarray(cam["t"], dtype=np.float64).reshape(3)
 
                 Z = R @ X_vec + t
@@ -274,7 +270,6 @@ class GDOptimizer:
                     if img_id in global_q_grads:
                         q = np.asarray(cam["q"], dtype=np.float64).reshape(4)
                         q = q - lr * global_q_grads[img_id]
-                        q, _ = self._normalize_quaternion(q)
                         cam["q"] = q
 
                 current_loss = self.loss()
@@ -319,15 +314,6 @@ class GDOptimizer:
                 else:
                     wait += 1
                     print(f"Waiting {wait}/{patience}")
-
-                    # self.constructor.track_to_point = {
-                    #     root: np.asarray(X, dtype=np.float64).copy()
-                    #     for root, X in old_track_to_point.items()
-                    # }
-                    #
-                    # for i, cam in enumerate(old_cameras):
-                    #     self.constructor.camera_matrices[i]["q"] = cam["q"]
-                    #     self.constructor.camera_matrices[i]["t"] = cam["t"]
 
                     if wait >= patience:
                         print(f"Early stopping at iteration {step + 1}")

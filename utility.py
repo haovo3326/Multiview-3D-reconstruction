@@ -12,10 +12,10 @@ def R_to_quaternion(R_mat):
 def quaternion_to_R(q):
     # input q: [w, x, y, z]
     q = np.asarray(q, dtype=np.float64)
-    q = q / np.linalg.norm(q)
+    q_norm = q / np.linalg.norm(q)
 
     # SciPy expects [x, y, z, w]
-    q_scipy = np.array([q[1], q[2], q[3], q[0]])
+    q_scipy = np.array([q_norm[1], q_norm[2], q_norm[3], q_norm[0]])
 
     R_mat = R.from_quat(q_scipy).as_matrix()
     return R_mat

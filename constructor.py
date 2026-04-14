@@ -16,6 +16,7 @@ class Constructor:
         self.extractor = SuperPoint(max_num_keypoints=2048).eval().to(self.device)
         self.matcher = LightGlue(features='superpoint').eval().to(self.device)
 
+        self.images = []
         self.features = []
         self.K = K.astype(np.float64)
         self.camera_matrices = []   # each item: {"q": [w,x,y,z], "t": (3,)}
@@ -25,8 +26,14 @@ class Constructor:
 
     def load_img(self, img_path):
         image = load_image(img_path).to(self.device)
+
+        # image = utility.normalize_brightness(image)  # <-- ADD THIS
+
+        image = image.to(self.device)
         feature = self.extractor.extract(image)
+
         self.features.append(feature)
+        self.images.append(image)
 
     def feature_matching(self, features0, features1):
         matches = self.matcher({'image0': features0, 'image1': features1})
@@ -222,4 +229,65 @@ class Constructor:
         ax.set_ylim(y_mid - max_range, y_mid + max_range)
         ax.set_zlim(z_mid - max_range, z_mid + max_range)
 
+        plt.show()
+
+    def display_essential_correspondences(self, idx0, idx1):
+        image0 = self.images[idx0]
+        image1 = self.images[idx1]
+
+        # to numpy (H,W,3)
+        img0 = image0.permute(1, 2, 0).cpu().numpy()
+        img1 = image1.permute(1, 2, 0).cpu().numpy()
+
+        features0 = self.features[idx0]
+        features1 = self.features[idx1]
+
+        keypoints0 = features0["keypoints"][0].cpu().numpy()
+        keypoints1 = features1["keypoints"][0].cpu().numpy()
+
+        matches01 = self.feature_matching(features0, features1)
+
+        pts0 = keypoints0[matches01[:, 0]]
+        pts1 = keypoints1[matches01[:, 1]]
+
+        E, inlier_mask = cv2.findEssentialMat(
+            pts0, pts1, self.K,
+            method=cv2.RANSAC,
+            prob=0.999,
+            threshold=1.0
+        )
+
+        if E is None:
+            print("E failed")
+            return
+
+        inlier_mask = inlier_mask.ravel().astype(bool)
+
+        pts0_in = pts0[inlier_mask]
+        pts1_in = pts1[inlier_mask]
+
+        print(f"Total matches: {len(matches01)}")
+        print(f"Inliers (E satisfied): {len(pts0_in)}")
+
+        # stack images
+        h = max(img0.shape[0], img1.shape[0])
+        w0 = img0.shape[1]
+        w1 = img1.shape[1]
+
+        canvas = np.zeros((h, w0 + w1, 3), dtype=img0.dtype)
+        canvas[:img0.shape[0], :w0] = img0
+        canvas[:img1.shape[0], w0:w0 + w1] = img1
+
+        # draw ALL inlier correspondences
+        for (p0, p1) in zip(pts0_in, pts1_in):
+            x0, y0 = int(p0[0]), int(p0[1])
+            x1, y1 = int(p1[0]) + w0, int(p1[1])
+
+            cv2.circle(canvas, (x0, y0), 2, (0, 255, 0), -1)
+            cv2.circle(canvas, (x1, y1), 2, (0, 255, 0), -1)
+            cv2.line(canvas, (x0, y0), (x1, y1), (0, 255, 0), 1)
+
+        plt.figure(figsize=(12, 6))
+        plt.imshow(canvas)
+        plt.axis("off")
         plt.show()

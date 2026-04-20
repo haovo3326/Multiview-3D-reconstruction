@@ -19,17 +19,22 @@ class Constructor:
         self.images = []
         self.features = []
         self.K = K.astype(np.float64)
+        self.intrinsic_parameters = utility.extract_intrinsics(self.K)
         self.camera_matrices = []   # each item: {"q": [w,x,y,z], "t": (3,)}
 
         self.tracker = dsu()
         self.track_to_point = {}
 
     def load_img(self, img_path):
-        image = load_image(img_path).to(self.device)
+        image = load_image(img_path).to(self.device)  # [C, H, W]
 
-        # image = utility.normalize_brightness(image)  # <-- ADD THIS
+        image = torch.nn.functional.interpolate(
+            image.unsqueeze(0),
+            size=(1024, 1024),
+            mode="bilinear",
+            align_corners=False
+        ).squeeze(0)
 
-        image = image.to(self.device)
         feature = self.extractor.extract(image)
 
         self.features.append(feature)
@@ -94,10 +99,13 @@ class Constructor:
         X01 = utility.triangulate_points(P0, P1, pts0, pts1)
 
         self.camera_matrices.append({
+            "k": utility.clone_intrinsics(self.intrinsic_parameters),
             "q": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
             "t": np.zeros(3, dtype=np.float64)
         })
+
         self.camera_matrices.append({
+            "k": utility.clone_intrinsics(self.intrinsic_parameters),
             "q": quaternion.astype(np.float64),
             "t": t.reshape(3).astype(np.float64)
         })
@@ -159,6 +167,7 @@ class Constructor:
             q_cur = utility.R_to_quaternion(R_cur)
 
             self.camera_matrices.append({
+                "k": utility.clone_intrinsics(self.intrinsic_parameters),
                 "q": q_cur.astype(np.float64),
                 "t": t_cur.reshape(3).astype(np.float64)
             })
@@ -206,12 +215,46 @@ class Constructor:
 
         fig = plt.figure(figsize=(8, 8))
         ax = fig.add_subplot(111, projection='3d')
+
+        # ===== point cloud =====
         ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=4)
 
+        # ===== cameras =====
+        for cam in self.camera_matrices:
+            q = cam["q"]
+            t = cam["t"].reshape(3, 1)
+
+            # quaternion -> R
+            R = utility.quaternion_to_R(q)
+
+            # camera center
+            C = -R.T @ t
+            C = C.reshape(3)
+
+            # viewing direction (camera Z axis)
+            d = R.T @ np.array([0.0, 0.0, 1.0])
+            d = d / np.linalg.norm(d)
+            d = d / 10
+
+            # plot center
+            ax.scatter(C[0], C[1], C[2], c='red', s=50)
+
+            # arrow scale
+            scale = 0.2 * (pts.max() - pts.min())
+
+            # plot direction
+            ax.quiver(
+                C[0], C[1], C[2],
+                d[0], d[1], d[2],
+                length=scale,
+                color='red'
+            )
+
+        # ===== axes =====
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
         ax.set_zlabel("Z")
-        ax.set_title("3D Point Cloud")
+        ax.set_title("3D Point Cloud + Cameras")
 
         x_min, x_max = pts[:, 0].min(), pts[:, 0].max()
         y_min, y_max = pts[:, 1].min(), pts[:, 1].max()

@@ -3,6 +3,18 @@ import cv2
 from scipy.spatial.transform import Rotation as R
 import torch
 
+def extract_intrinsics(K):
+    fx = K[0, 0]
+    fy = K[1, 1]
+    s = K[0, 1]
+    cx = K[0, 2]
+    cy = K[1, 2]
+
+    return np.array([fx, fy, cx, cy, s])
+
+def clone_intrinsics(k):
+    return k.copy()
+
 def R_to_quaternion(R_mat):
     r = R.from_matrix(R_mat)
     q = r.as_quat()  # [x, y, z, w]

@@ -48,7 +48,7 @@ def calibrate():
 
     cv2.destroyAllWindows()
 
-    _, K, _, _, _ = cv2.calibrateCamera(
+    _, K, dist, _, _ = cv2.calibrateCamera(
         objpoints,
         imgpoints,
         (860, 860),
@@ -56,4 +56,4 @@ def calibrate():
         None
     )
 
-    return K
+    return K, dist

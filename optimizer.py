@@ -3,7 +3,7 @@ from collections import deque
 import utility
 
 
-class GDOptimizer:
+class GD_optimizer:
     def __init__(self, constructor):
         self.constructor = constructor
 
@@ -329,3 +329,377 @@ class GDOptimizer:
             self.constructor.camera_matrices[i]["t"] = cam["t"]
 
         print("Best reprojection loss:", best_loss)
+
+class LM_optimizer:
+    def __init__(self, constructor):
+        self.constructor = constructor
+
+    def _quat_norm_jacobian(self, q):
+        q = np.asarray(q, dtype=np.float64).reshape(4)
+        n = np.linalg.norm(q)
+        if n < 1e-12:
+            raise ValueError("Quaternion norm is too close to zero.")
+
+        q_prime = q / n
+        I = np.eye(4, dtype=np.float64)
+        J = (I - np.outer(q_prime, q_prime)) / n
+        return J
+
+    def _get_tracks(self):
+        groups = self.constructor.tracker.groups()
+        tracks = []
+
+        for group in groups:
+            if len(group) == 0:
+                continue
+
+            root = self.constructor.tracker.find(group[0])
+            X = self.constructor.track_to_point.get(root)
+
+            if X is None:
+                continue
+
+            tracks.append({
+                "root": root,
+                "point3d": np.asarray(X, dtype=np.float64).reshape(3),
+                "observations": group
+            })
+
+        return tracks
+
+    def _build_K_from_k(self, k):
+        fx, fy, cx, cy, s = np.asarray(k, dtype=np.float64).reshape(5)
+        return np.array([
+            [fx, s,  cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0]
+        ], dtype=np.float64)
+
+    def _pack_theta(self):
+        tracks = self._get_tracks()
+
+        point_roots = []
+        point_blocks = []
+
+        for track in tracks:
+            root = track["root"]
+            X = np.asarray(track["point3d"], dtype=np.float64).reshape(3)
+            point_roots.append(root)
+            point_blocks.append(X)
+
+        cam_blocks = []
+        for cam in self.constructor.camera_matrices:
+            k = np.asarray(cam["k"], dtype=np.float64).reshape(5)
+            q = np.asarray(cam["q"], dtype=np.float64).reshape(4)
+            t = np.asarray(cam["t"], dtype=np.float64).reshape(3)
+            cam_blocks.append(np.concatenate([k, q, t]))
+
+        theta_points = np.concatenate(point_blocks) if len(point_blocks) > 0 else np.zeros(0, dtype=np.float64)
+        theta_cams = np.concatenate(cam_blocks) if len(cam_blocks) > 0 else np.zeros(0, dtype=np.float64)
+        theta = np.concatenate([theta_points, theta_cams])
+
+        meta = {
+            "tracks": tracks,
+            "point_roots": point_roots,
+            "root_to_point_idx": {root: i for i, root in enumerate(point_roots)},
+            "N": len(point_roots),
+            "M": len(self.constructor.camera_matrices)
+        }
+
+        return theta.astype(np.float64), meta
+
+    def _unpack_theta(self, theta, meta):
+        theta = np.asarray(theta, dtype=np.float64).reshape(-1)
+
+        N = meta["N"]
+        M = meta["M"]
+
+        expected = 3 * N + 12 * M
+        if theta.size != expected:
+            raise ValueError(f"Theta size mismatch. Expected {expected}, got {theta.size}")
+
+        point_map = {}
+        cursor = 0
+
+        for root in meta["point_roots"]:
+            point_map[root] = theta[cursor:cursor + 3].copy()
+            cursor += 3
+
+        cameras = []
+        for _ in range(M):
+            k = theta[cursor:cursor + 5].copy()
+            cursor += 5
+
+            q = theta[cursor:cursor + 4].copy()
+            cursor += 4
+
+            t = theta[cursor:cursor + 3].copy()
+            cursor += 3
+
+            cameras.append({
+                "k": k,
+                "q": q,
+                "t": t
+            })
+
+        return point_map, cameras
+
+    def _apply_theta(self, theta, meta):
+        point_map, cameras = self._unpack_theta(theta, meta)
+
+        for root, X in point_map.items():
+            current_root = self.constructor.tracker.find(root)
+            if current_root in self.constructor.track_to_point:
+                self.constructor.track_to_point[current_root] = X.copy()
+
+        for i, cam in enumerate(cameras):
+            self.constructor.camera_matrices[i]["k"] = cam["k"].copy()
+            self.constructor.camera_matrices[i]["q"] = cam["q"].copy()  # raw q
+            self.constructor.camera_matrices[i]["t"] = cam["t"].copy()
+
+    def _dR_dq_prime(self, q_prime):
+        w, x, y, z = q_prime
+
+        dR_dw = np.array([
+            [0.0, -2.0 * z,  2.0 * y],
+            [2.0 * z,  0.0, -2.0 * x],
+            [-2.0 * y, 2.0 * x, 0.0]
+        ], dtype=np.float64)
+
+        dR_dx = np.array([
+            [0.0, 2.0 * y, 2.0 * z],
+            [2.0 * y, -4.0 * x, -2.0 * w],
+            [2.0 * z,  2.0 * w, -4.0 * x]
+        ], dtype=np.float64)
+
+        dR_dy = np.array([
+            [-4.0 * y, 2.0 * x,  2.0 * w],
+            [2.0 * x,  0.0,      2.0 * z],
+            [-2.0 * w, 2.0 * z, -4.0 * y]
+        ], dtype=np.float64)
+
+        dR_dz = np.array([
+            [-4.0 * z, -2.0 * w, 2.0 * x],
+            [2.0 * w,  -4.0 * z, 2.0 * y],
+            [2.0 * x,   2.0 * y, 0.0]
+        ], dtype=np.float64)
+
+        return dR_dw, dR_dx, dR_dy, dR_dz
+
+    def _build_system(self, theta, meta):
+        point_map, cameras = self._unpack_theta(theta, meta)
+
+        N = meta["N"]
+        M = meta["M"]
+        total_params = 3 * N + 12 * M
+
+        residual_rows = []
+        jacobian_rows = []
+
+        for track in meta["tracks"]:
+            root = track["root"]
+            X = np.asarray(point_map[root], dtype=np.float64).reshape(3)
+            observations = track["observations"]
+
+            if observations is None or len(observations) == 0:
+                continue
+
+            weight = 1.0 / len(observations)
+            sqrt_w = np.sqrt(weight)
+
+            point_idx = meta["root_to_point_idx"][root]
+            point_base = 3 * point_idx
+
+            for (img_id, kp_id) in observations:
+                features = self.constructor.features[img_id]
+                keypoints = features["keypoints"][0].cpu().numpy().astype(np.float64)
+                x_ij = keypoints[int(kp_id)].reshape(2)
+
+                cam = cameras[img_id]
+                k = np.asarray(cam["k"], dtype=np.float64).reshape(5)
+                q_raw = np.asarray(cam["q"], dtype=np.float64).reshape(4)
+                t = np.asarray(cam["t"], dtype=np.float64).reshape(3)
+
+                q_norm = np.linalg.norm(q_raw)
+                if q_norm < 1e-12:
+                    continue
+
+                q_prime = q_raw / q_norm
+                R = utility.quaternion_to_R(q_raw)
+                K = self._build_K_from_k(k)
+
+                Z = R @ X + t
+                Y = K @ Z
+
+                if abs(Y[2]) < 1e-12:
+                    continue
+
+                x_hat = np.array([
+                    Y[0] / Y[2],
+                    Y[1] / Y[2]
+                ], dtype=np.float64)
+
+                r_ij = sqrt_w * (x_ij - x_hat)
+
+                dxhat_dY = np.array([
+                    [1.0 / Y[2], 0.0, -Y[0] / (Y[2] ** 2)],
+                    [0.0, 1.0 / Y[2], -Y[1] / (Y[2] ** 2)]
+                ], dtype=np.float64)
+
+                dr_dY = -sqrt_w * dxhat_dY
+                dr_dZ = dr_dY @ K
+                dr_dX = dr_dZ @ R
+                dr_dt = dr_dZ.copy()
+
+                Z0, Z1, Z2 = Z
+
+                dY_dfx = np.array([Z0, 0.0, 0.0], dtype=np.float64)
+                dY_dfy = np.array([0.0, Z1, 0.0], dtype=np.float64)
+                dY_dcx = np.array([Z2, 0.0, 0.0], dtype=np.float64)
+                dY_dcy = np.array([0.0, Z2, 0.0], dtype=np.float64)
+                dY_ds  = np.array([Z1, 0.0, 0.0], dtype=np.float64)
+
+                dr_dk = np.column_stack([
+                    dr_dY @ dY_dfx,
+                    dr_dY @ dY_dfy,
+                    dr_dY @ dY_dcx,
+                    dr_dY @ dY_dcy,
+                    dr_dY @ dY_ds
+                ])
+
+                dR_dw, dR_dx, dR_dy, dR_dz = self._dR_dq_prime(q_prime)
+
+                dZ_dw = dR_dw @ X
+                dZ_dx = dR_dx @ X
+                dZ_dy = dR_dy @ X
+                dZ_dz = dR_dz @ X
+
+                dr_dq_prime = np.column_stack([
+                    dr_dZ @ dZ_dw,
+                    dr_dZ @ dZ_dx,
+                    dr_dZ @ dZ_dy,
+                    dr_dZ @ dZ_dz
+                ])
+
+                J_norm = self._quat_norm_jacobian(q_raw)
+                dr_dq_raw = dr_dq_prime @ J_norm
+
+                row = np.zeros((2, total_params), dtype=np.float64)
+
+                row[:, point_base:point_base + 3] = dr_dX
+
+                cam_base = 3 * N + 12 * img_id
+                row[:, cam_base:cam_base + 5] = dr_dk
+                row[:, cam_base + 5:cam_base + 9] = dr_dq_raw
+                row[:, cam_base + 9:cam_base + 12] = dr_dt
+
+                residual_rows.append(r_ij)
+                jacobian_rows.append(row)
+
+        if len(residual_rows) == 0:
+            return np.zeros(0, dtype=np.float64), np.zeros((0, total_params), dtype=np.float64)
+
+        r = np.vstack(residual_rows).reshape(-1)
+        J = np.vstack(jacobian_rows)
+
+        return r, J
+
+    def _normalized_loss(self, r):
+        if r.size == 0:
+            return 0.0
+        return np.sqrt(np.dot(r, r) / r.size)
+
+    def optimize(self, iters=20, lambda_init=1e-3, lambda_scale=10.0,
+                 step_tol=1e-8, loss_tol=1e-12, loss_file="lm_loss_log.txt"):
+        theta, meta = self._pack_theta()
+
+        best_theta = theta.copy()
+        best_r, _ = self._build_system(theta, meta)
+        best_loss = 0.5 * np.dot(best_r, best_r) if best_r.size > 0 else 0.0
+
+        lambda_ = float(lambda_init)
+
+        with open(loss_file, "w", encoding="utf-8") as f:
+            f.write("step,loss,lambda\n")
+            f.write(f"0,{self._normalized_loss(best_r)},{lambda_}\n")
+            f.flush()
+
+            for step in range(iters):
+                print(f"LM Iteration {step + 1}/{iters}...")
+
+                r, J = self._build_system(theta, meta)
+                current_loss = 0.5 * np.dot(r, r) if r.size > 0 else 0.0
+                current_loss_norm = self._normalized_loss(r)
+
+                if r.size == 0:
+                    print("No valid residuals.")
+                    break
+
+                A = J.T @ J + lambda_ * np.eye(theta.size, dtype=np.float64)
+                g = J.T @ r
+
+                try:
+                    delta = np.linalg.solve(A, -g)
+                except np.linalg.LinAlgError:
+                    delta = np.linalg.lstsq(A, -g, rcond=None)[0]
+
+                delta_norm = np.linalg.norm(delta)
+                if delta_norm < step_tol:
+                    print("LM stopped: step norm is small.")
+                    break
+
+                theta_candidate = theta + delta
+
+                point_map_candidate, cameras_candidate = self._unpack_theta(theta_candidate, meta)
+
+                valid = True
+                for cam in cameras_candidate:
+                    k = cam["k"]
+                    q = cam["q"]
+
+                    if np.linalg.norm(q) < 1e-12:
+                        valid = False
+                        break
+                    if k[0] <= 1e-9 or k[1] <= 1e-9:
+                        valid = False
+                        break
+
+                if not valid:
+                    lambda_ *= lambda_scale
+                    print(f"Rejected (invalid params). lambda -> {lambda_:.6e}")
+                    f.write(f"{step},{current_loss_norm},{lambda_}\n")
+                    f.flush()
+                    continue
+
+                r_candidate, _ = self._build_system(theta_candidate, meta)
+                candidate_loss = 0.5 * np.dot(r_candidate, r_candidate) if r_candidate.size > 0 else current_loss
+                candidate_loss_norm = self._normalized_loss(r_candidate)
+
+                if candidate_loss < current_loss:
+                    theta = theta_candidate
+                    lambda_ /= lambda_scale
+
+                    print(f"Accepted. RMSE: {current_loss_norm:.12f} -> {candidate_loss_norm:.12f}")
+
+                    if candidate_loss < best_loss:
+                        best_loss = candidate_loss
+                        best_theta = theta.copy()
+
+                    if abs(current_loss - candidate_loss) < loss_tol:
+                        print("LM stopped: loss improvement is small.")
+                        f.write(f"{step},{candidate_loss_norm},{lambda_}\n")
+                        f.flush()
+                        break
+                else:
+                    lambda_ *= lambda_scale
+                    print(f"Rejected. RMSE: {candidate_loss_norm:.12f}, lambda -> {lambda_:.6e}")
+
+                log_loss = candidate_loss_norm if candidate_loss < current_loss else current_loss_norm
+                f.write(f"{step},{log_loss},{lambda_}\n")
+                f.flush()
+
+        self._apply_theta(best_theta, meta)
+
+        best_r, _ = self._build_system(best_theta, meta)
+        print("Best LM RMSE:", self._normalized_loss(best_r))
+

@@ -11,7 +11,7 @@ from dsu import dsu
 
 
 class Constructor:
-    def __init__(self, K):
+    def __init__(self, K, dist_coeffs=None):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.extractor = SuperPoint(max_num_keypoints=2048).eval().to(self.device)
         self.matcher = LightGlue(features='superpoint').eval().to(self.device)
@@ -20,10 +20,13 @@ class Constructor:
         self.features = []
         self.K = K.astype(np.float64)
         self.intrinsic_parameters = utility.extract_intrinsics(self.K)
+        self.radial_parameters = utility.extract_radial_distortion(dist_coeffs)
+        self.dist_coeffs_radial = utility.build_radial_dist_coeffs(self.radial_parameters)
         self.camera_matrices = []   # each item: {"q": [w,x,y,z], "t": (3,)}
 
         self.tracker = dsu()
         self.track_to_point = {}
+        self.point_to_color = {}
 
     def load_img(self, img_path):
         image = load_image(img_path).to(self.device)  # [C, H, W]
@@ -45,13 +48,24 @@ class Constructor:
         matches = rbd(matches)
         return matches['matches'].cpu().numpy()
 
+    def undistort_points(self, points):
+        points = np.asarray(points, dtype=np.float32).reshape(-1, 1, 2)
+        return cv2.undistortPoints(
+            points,
+            self.K,
+            self.dist_coeffs_radial,
+            P=self.K
+        ).reshape(-1, 2)
+
     def compute_pose(self, keypoints0, keypoints1, matches01, K):
         samples0 = keypoints0[matches01[:, 0]]
         samples1 = keypoints1[matches01[:, 1]]
+        samples0_pose = self.undistort_points(samples0)
+        samples1_pose = self.undistort_points(samples1)
 
         E, inlier_mask = cv2.findEssentialMat(
-            samples0,
-            samples1,
+            samples0_pose,
+            samples1_pose,
             K,
             method=cv2.RANSAC,
             prob=0.999,
@@ -60,10 +74,10 @@ class Constructor:
 
         inlier_mask = inlier_mask.ravel().astype(bool)
         matches01 = matches01[inlier_mask]
-        samples0 = samples0[inlier_mask]
-        samples1 = samples1[inlier_mask]
+        samples0_pose = samples0_pose[inlier_mask]
+        samples1_pose = samples1_pose[inlier_mask]
 
-        _, R, t, pose_mask = cv2.recoverPose(E, samples0, samples1, K)
+        _, R, t, pose_mask = cv2.recoverPose(E, samples0_pose, samples1_pose, K)
         pose_mask = pose_mask.ravel().astype(bool)
         matches01 = matches01[pose_mask]
 
@@ -96,16 +110,20 @@ class Constructor:
 
         pts0 = keypoints0[matches01[:, 0]]
         pts1 = keypoints1[matches01[:, 1]]
+        pts0 = self.undistort_points(pts0)
+        pts1 = self.undistort_points(pts1)
         X01 = utility.triangulate_points(P0, P1, pts0, pts1)
 
         self.camera_matrices.append({
             "k": utility.clone_intrinsics(self.intrinsic_parameters),
+            "d": utility.clone_radial_distortion(self.radial_parameters),
             "q": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
             "t": np.zeros(3, dtype=np.float64)
         })
 
         self.camera_matrices.append({
             "k": utility.clone_intrinsics(self.intrinsic_parameters),
+            "d": utility.clone_radial_distortion(self.radial_parameters),
             "q": quaternion.astype(np.float64),
             "t": t.reshape(3).astype(np.float64)
         })
@@ -152,7 +170,7 @@ class Constructor:
                 objectPoints=obj_points,
                 imagePoints=img_points,
                 cameraMatrix=self.K,
-                distCoeffs=None,
+                distCoeffs=self.dist_coeffs_radial,
                 flags=cv2.SOLVEPNP_EPNP,
                 reprojectionError=8.0,
                 confidence=0.999,
@@ -168,6 +186,7 @@ class Constructor:
 
             self.camera_matrices.append({
                 "k": utility.clone_intrinsics(self.intrinsic_parameters),
+                "d": utility.clone_radial_distortion(self.radial_parameters),
                 "q": q_cur.astype(np.float64),
                 "t": t_cur.reshape(3).astype(np.float64)
             })
@@ -185,6 +204,8 @@ class Constructor:
 
             pts_pre = keypoints_pre[matches_pre_cur[:, 0]]
             pts_cur = keypoints_cur[matches_pre_cur[:, 1]]
+            pts_pre = self.undistort_points(pts_pre)
+            pts_cur = self.undistort_points(pts_cur)
             X_pre_cur = utility.triangulate_points(P_pre, P_cur, pts_pre, pts_cur)
 
             for j, (i_pre, i_cur) in enumerate(matches_pre_cur):
@@ -192,10 +213,70 @@ class Constructor:
                 if root not in self.track_to_point:
                     self.track_to_point[root] = np.asarray(X_pre_cur[j], dtype=np.float64).reshape(3)
 
+    def colorize_point_cloud(self):
+        groups = self.tracker.groups()
+
+        for group in groups:
+            if len(group) == 0:
+                continue
+            root = group[0]
+            X = self.track_to_point[root]
+            sample_color = []
+            sample_depth = []
+
+            for sample in group:
+                image_id, keypoint_id = sample
+                cam = self.camera_matrices[image_id]
+                R = utility.quaternion_to_R(cam["q"])
+                t = cam["t"].reshape(3, 1)
+                P = utility.build_projection_matrix(self.K, R, t)
+
+                keypoint = self.features[image_id]["keypoints"][0, keypoint_id].cpu().numpy()
+                x, y = keypoint
+                image = self.images[image_id].permute(1, 2, 0).cpu().numpy()
+                h, w = image.shape[:2]
+
+                # Color interpolation
+                x = np.clip(x, 0, w - 1)
+                y = np.clip(y, 0, h - 1)
+                x0, y0 = int(np.floor(x)), int(np.floor(y))
+                x1, y1 = min(x0 + 1, w - 1), min(y0 + 1, h - 1)
+                dx = x - x0
+                dy = y - y0
+                color = (
+                    (1 - dx) * (1 - dy) * image[y0, x0]
+                    + dx * (1 - dy) * image[y0, x1]
+                    + (1 - dx) * dy * image[y1, x0]
+                    + dx * dy * image[y1, x1]
+                )
+                sample_color.append(color)
+
+                # Depth
+                X_h = np.append(np.asarray(X, dtype=np.float64).reshape(3), 1.0)
+                projection = P @ X_h
+                depth = projection[2]
+                if depth <= 0:
+                    continue
+                sample_depth.append(depth)
+
+            if len(sample_color) == 0:
+                continue
+
+            sample_color = np.asarray(sample_color, dtype=np.float64)
+            sample_depth = np.asarray(sample_depth, dtype=np.float64)
+
+            scores = -sample_depth
+            weights = np.exp(scores - np.max(scores))
+            weights = weights / np.sum(weights)
+
+            final_color = np.sum(sample_color * weights[:, None], axis=0)
+            self.point_to_color[root] = final_color
+
     def display_point_cloud(self):
         pts = []
+        colors = []
 
-        for X in self.track_to_point.values():
+        for root, X in self.track_to_point.items():
             if X is None:
                 continue
 
@@ -206,18 +287,24 @@ class Constructor:
                 continue
 
             pts.append(X)
+            color = self.point_to_color.get(root)
+            if color is None:
+                colors.append(np.array([0.0, 0.0, 1.0], dtype=np.float64))
+            else:
+                colors.append(np.clip(np.asarray(color, dtype=np.float64).reshape(3), 0.0, 1.0))
 
         if len(pts) == 0:
             print("No valid 3D points to display.")
             return
 
         pts = np.asarray(pts, dtype=np.float64)
+        colors = np.asarray(colors, dtype=np.float64)
 
         fig = plt.figure(figsize=(8, 8))
         ax = fig.add_subplot(111, projection='3d')
 
         # ===== point cloud =====
-        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=4)
+        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=colors, s=4)
 
         # ===== cameras =====
         for cam in self.camera_matrices:
@@ -292,9 +379,11 @@ class Constructor:
 
         pts0 = keypoints0[matches01[:, 0]]
         pts1 = keypoints1[matches01[:, 1]]
+        pts0_pose = self.undistort_points(pts0)
+        pts1_pose = self.undistort_points(pts1)
 
         E, inlier_mask = cv2.findEssentialMat(
-            pts0, pts1, self.K,
+            pts0_pose, pts1_pose, self.K,
             method=cv2.RANSAC,
             prob=0.999,
             threshold=1.0

@@ -1,4 +1,6 @@
 # A demonstration of complete 3D reconstruction pipeline utilizing SuperPoint + SuperGlue and PnP (Perspective-n-Point)
+![Uploading image.png…]()
+
 ## Overview
 This project demonstrates the pipeline for reconstructing 3D scene from images captured by the same camera from multiple angles. The pipeline includes 3 stages:
 1. Camera calibration
